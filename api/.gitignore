@@ -1,0 +1,10 @@
+# dotenv
+.env
+.env.*
+
+# terraform
+**/.terraform/
+**/*.tfstate
+**/*.tfstate.*
+crash.log
+*.tfplan
