@@ -182,3 +182,6 @@ override.tf.json
 .terraformrc
 terraform.rc
 .terraform/
+.terraform/
+*.tfstate
+*.tfstate.*
