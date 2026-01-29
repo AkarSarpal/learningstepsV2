@@ -1,52 +1,113 @@
-name: Build -> Scan -> Push (ACR)
+name: docker-build-scan-push
 
 on:
-  push:
-    branches: [ "main" ]
   pull_request:
+    paths:
+      - "api/**"
+      - ".github/workflows/**"
+  push:
+    branches: [ main ]
+    paths:
+      - "api/**"
+      - ".github/workflows/**"
+
+permissions:
+  contents: read
+  id-token: write  # required for Azure OIDC login
 
 env:
   IMAGE_NAME: learningsteps-api
 
 jobs:
-  build_scan_push:
+  build_test:
     runs-on: ubuntu-latest
-
+    defaults:
+      run:
+        working-directory: api
     steps:
       - uses: actions/checkout@v4
 
-      - name: Set image tag
-        run: echo "IMAGE_TAG=${GITHUB_SHA::7}" >> $GITHUB_ENV
-
-      - name: Build Docker image
-        run: |
-          docker build -t $IMAGE_NAME:$IMAGE_TAG -f api/dockerfile api
-
-      - name: Trivy image scan (fail on HIGH/CRITICAL)
-        uses: aquasecurity/trivy-action@0.24.0
+      - name: Setup Python
+        uses: actions/setup-python@v5
         with:
-          image-ref: ${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}
-          format: table
-          vuln-type: 'os,library'
-          severity: 'HIGH,CRITICAL'
-          exit-code: '1'
+          python-version: "3.11"
 
-      # Only push on main (not PR) after scan passes
-      - name: Azure Login (OIDC recommended)
-        if: github.event_name == 'push'
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install ruff pytest
+
+      - name: Lint (ruff)
+        run: ruff check .
+
+      - name: Tests (pytest)
+        run: pytest -q
+
+  build_and_scan_image:
+    runs-on: ubuntu-latest
+    needs: build_test
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build Docker image (local)
+        run: |
+          docker build \
+            -f api/dockerfile \
+            -t $IMAGE_NAME:${{ github.sha }} \
+            api
+
+      - name: Trivy scan (fail on HIGH/CRITICAL)
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: "${{ env.IMAGE_NAME }}:${{ github.sha }}"
+          format: "table"
+          exit-code: "1"
+          ignore-unfixed: true
+          severity: "HIGH,CRITICAL"
+
+  push_and_deploy:
+    runs-on: ubuntu-latest
+    needs: build_and_scan_image
+    if: github.ref == 'refs/heads/main'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Azure login (OIDC)
         uses: azure/login@v2
         with:
-          client-id: ${{ secrets.AZURE_CLIENT_ID }}
-          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
-          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
 
-      - name: ACR login
-        if: github.event_name == 'push'
-        run: az acr login --name ${{ secrets.ACR_NAME }}
-
-      - name: Tag + Push to ACR
-        if: github.event_name == 'push'
+      - name: Get ACR login server
+        id: acr
         run: |
-          ACR_LOGIN_SERVER=$(az acr show -n ${{ secrets.ACR_NAME }} --query loginServer -o tsv)
-          docker tag $IMAGE_NAME:$IMAGE_TAG $ACR_LOGIN_SERVER/$IMAGE_NAME:$IMAGE_TAG
-          docker push $ACR_LOGIN_SERVER/$IMAGE_NAME:$IMAGE_TAG
+          LOGIN_SERVER=$(az acr show -n ${{ vars.ACR_NAME }} --query loginServer -o tsv)
+          echo "login_server=$LOGIN_SERVER" >> $GITHUB_OUTPUT
+
+      - name: Login to ACR
+        run: az acr login --name ${{ vars.ACR_NAME }}
+
+      - name: Build + tag for ACR
+        run: |
+          docker build -f api/dockerfile -t $IMAGE_NAME:${{ github.sha }} api
+          docker tag $IMAGE_NAME:${{ github.sha }} ${{ steps.acr.outputs.login_server }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
+          docker tag $IMAGE_NAME:${{ github.sha }} ${{ steps.acr.outputs.login_server }}/${{ env.IMAGE_NAME }}:latest
+
+      - name: Push to ACR
+        run: |
+          docker push ${{ steps.acr.outputs.login_server }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
+          docker push ${{ steps.acr.outputs.login_server }}/${{ env.IMAGE_NAME }}:latest
+
+      - name: Set AKS context
+        uses: azure/aks-set-context@v4
+        with:
+          resource-group: ${{ vars.AKS_RESOURCE_GROUP }}
+          cluster-name: ${{ vars.AKS_CLUSTER_NAME }}
+
+      - name: Deploy (rollout restart)
+        run: |
+          # Example assumes you already have a Deployment named "api"
+          kubectl set image deployment/api api=${{ steps.acr.outputs.login_server }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
+          kubectl rollout status deployment/api
