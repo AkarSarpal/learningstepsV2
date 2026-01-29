@@ -22,7 +22,8 @@ def print_response(response):
     print(f"Status Code: {response.status_code}")
     try:
         print(f"Response: {json.dumps(response.json(), indent=2, default=str)}")
-    except:
+    except ValueError:
+    # .json() failed because the response wasn't JSON
         print(f"Response: {response.text}")
 
 def test_create_entry():
